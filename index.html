@@ -1,967 +1,387 @@
 <!DOCTYPE html>
-<html lang="fa" dir="rtl">
+<html lang="fa">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>WebAR</title>
+  <title>AR</title>
   <style>
     * {
       margin: 0;
       padding: 0;
       box-sizing: border-box;
       user-select: none;
-      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none;
     }
     html, body {
-      width: 100%;
-      height: 100%;
+      width: 100vw;
+      height: 100vh;
       overflow: hidden;
-      background: #000;
+      background-color: #000;
     }
     #camera-feed {
       position: fixed;
-      inset: 0;
-      width: 100%;
-      height: 100%;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
       object-fit: cover;
       z-index: 1;
-      background: #000;
     }
     #ar-canvas {
       position: fixed;
-      inset: 0;
-      width: 100%;
-      height: 100%;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
       z-index: 2;
-      pointer-events: none;
+      pointer-events: auto;
+    }
+    #chroma-video {
+      display: none;
     }
   </style>
 </head>
 <body>
 
-  <!-- تصویر زنده دوربین (بدون هیچ دکمه، آیکون یا نوشته روی صفحه) -->
+  <!-- تصویر زنده دوربین -->
   <video id="camera-feed" autoplay playsinline muted></video>
+
+  <!-- ویدیوی کاراکتر پرده سبز -->
+  <video id="chroma-video" src="character.mp4" loop muted playsinline autoplay crossorigin="anonymous"></video>
+
+  <!-- بوم رندر سه بعدی واقعیت افزوده -->
   <canvas id="ar-canvas"></canvas>
 
+  <!-- کتابخانه Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
   <script>
-    (function () {
-      'use strict';
-
-      const video = document.getElementById('camera-feed');
+    (async function () {
+      const cameraVideo = document.getElementById('camera-feed');
+      const chromaVideo = document.getElementById('chroma-video');
       const canvas = document.getElementById('ar-canvas');
-      const ctx = canvas.getContext('2d', { alpha: true });
 
-      // =========================================================================
-      // ۱. باز شدن فوری دوربین به محض باز شدن لینک (بدون صفحه ورود)
-      // =========================================================================
-      async function launchCamera() {
+      // ۱. باز شدن مستقیم و خودکار دوربین پشت
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          audio: false
+        });
+        cameraVideo.srcObject = stream;
+        await cameraVideo.play();
+      } catch (err) {
+        // در صورت عدم دسترسی به دوربین پشت، باز کردن دوربین پیش‌فرض
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: { ideal: 'environment' },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 }
-            },
-            audio: false
-          });
-          video.srcObject = stream;
-          await video.play();
-        } catch (err) {
-          try {
-            const fallback = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-            video.srcObject = fallback;
-            await video.play();
-          } catch (e) {}
-        }
+          const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          cameraVideo.srcObject = fallbackStream;
+          await cameraVideo.play();
+        } catch (e) {}
       }
 
-      // =========================================================================
-      // ۲. ساخت بافت‌های Cutout واقع‌گرایانه (عکس اول شهاب‌سنگ و عکس آخر چاله و مترو)
-      //    + بافت دود حجمی برای انیمیشن نمای روبرو (با رفع بریدگی لبه چپ چاله)
-      // =========================================================================
-      const textures = {
-        meteorCutout: document.createElement('canvas'),
-        craterRim: document.createElement('canvas'),
-        craterInnerMask: document.createElement('canvas'),
-        metroTrain: document.createElement('canvas'),
-        smokeSprite: document.createElement('canvas')
-      };
+      // پخش خودکار ویدیوی کاراکتر (و فعال‌سازی صدا در صورت لمس صفحه)
+      chromaVideo.play().catch(() => {});
+      window.addEventListener('pointerdown', () => {
+        if (chromaVideo.paused) chromaVideo.play();
+        chromaVideo.muted = false;
+      }, { once: true });
 
-      // تابع نویز طبیعی برای بافت سنگ، آسفالت شکسته و دود
-      function hash2D(x, y) {
-        const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
-        return n - Math.floor(n);
-      }
-      function smoothNoise(x, y) {
-        const ix = Math.floor(x), iy = Math.floor(y);
-        const fx = x - ix, fy = y - iy;
-        const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
-        const a = hash2D(ix, iy), b = hash2D(ix + 1, iy);
-        const c = hash2D(ix, iy + 1), d = hash2D(ix + 1, iy + 1);
-        return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
-      }
-      function fbm(x, y, octaves = 5) {
-        let val = 0, amp = 0.5, freq = 1;
-        for (let i = 0; i < octaves; i++) {
-          val += amp * smoothNoise(x * freq, y * freq);
-          freq *= 2.05;
-          amp *= 0.5;
-        }
-        return val;
-      }
+      // ۲. راه‌اندازی صحنه سه‌بعدی Three.js
+      const renderer = new THREE.WebGLRenderer({
+        canvas: canvas,
+        alpha: true,
+        antialias: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
-      // ۲- الف) ساخت بافت دود حجمی سینمایی (برای انیمیشن نمای روبرو)
-      function buildSmokeSprite() {
-        const size = 256;
-        textures.smokeSprite.width = size;
-        textures.smokeSprite.height = size;
-        const sCtx = textures.smokeSprite.getContext('2d');
-        const imgData = sCtx.createImageData(size, size);
-        const data = imgData.data;
-        const cx = size / 2, cy = size / 2, maxR = size / 2;
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        500
+      );
+      camera.position.set(0, 1.6, 0); // ارتفاع استاندارد دید انسان (۱.۶ متر)
 
-        for (let y = 0; y < size; y++) {
-          for (let x = 0; x < size; x++) {
-            const dx = (x - cx) / maxR;
-            const dy = (y - cy) / maxR;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist >= 1) continue;
+      // ۳. شیدر هوشمند حذف پرده سبز (Chroma Key + Spill Suppression)
+      const videoTexture = new THREE.VideoTexture(chromaVideo);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.format = THREE.RGBAFormat;
 
-            const n = fbm(x * 0.035, y * 0.035, 4);
-            const falloff = Math.pow(1 - dist, 1.85);
-            const alpha = Math.max(0, Math.min(1, falloff * (0.45 + n * 0.85)));
-            const shade = 28 + n * 42;
-
-            const idx = (y * size + x) * 4;
-            data[idx] = shade;
-            data[idx + 1] = shade;
-            data[idx + 2] = shade + 3;
-            data[idx + 3] = (alpha * 255) | 0;
+      const chromaKeyMaterial = new THREE.ShaderMaterial({
+        transparent: true,
+        side: THREE.DoubleSide,
+        uniforms: {
+          uTexture: { value: videoTexture },
+          uKeyColor: { value: new THREE.Color(0.05, 0.95, 0.05) },
+          uSimilarity: { value: 0.42 },
+          uSmoothness: { value: 0.12 },
+          uSpill: { value: 0.18 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
           }
-        }
-        sCtx.putImageData(imgData, 0, 0);
-      }
+        `,
+        fragmentShader: `
+          uniform sampler2D uTexture;
+          uniform vec3 uKeyColor;
+          uniform float uSimilarity;
+          uniform float uSmoothness;
+          uniform float uSpill;
+          varying vec2 vUv;
 
-      // ۲- ب) بازسازی دقیق عکس اول: شهاب‌سنگ آتشین با دنباله دود و آتش (نمای آسمان و فرود)
-      function buildMeteorCutout() {
-        const w = 512, h = 512;
-        textures.meteorCutout.width = w;
-        textures.meteorCutout.height = h;
-        const mCtx = textures.meteorCutout.getContext('2d');
-
-        // زاویه مورب از بالا-راست به پایین-چپ دقیقاً مشابه عکس اول شما
-        mCtx.save();
-        mCtx.translate(w * 0.28, h * 0.72);
-        mCtx.rotate(-Math.PI * 0.25);
-
-        // دنباله دود خاکستری-قهوه‌ای انتهایی
-        for (let i = 0; i < 38; i++) {
-          const t = i / 38;
-          const x = t * 340 + (Math.random() - 0.5) * 14;
-          const y = (Math.random() - 0.5) * (18 + t * 42);
-          const r = 16 + t * 36;
-          const grad = mCtx.createRadialGradient(x, y, 2, x, y, r);
-          const alpha = (1 - t) * 0.38;
-          grad.addColorStop(0, `rgba(65, 50, 42, ${alpha})`);
-          grad.addColorStop(0.6, `rgba(40, 34, 30, ${alpha * 0.5})`);
-          grad.addColorStop(1, 'rgba(20, 20, 20, 0)');
-          mCtx.fillStyle = grad;
-          mCtx.beginPath();
-          mCtx.arc(x, y, r, 0, Math.PI * 2);
-          mCtx.fill();
-        }
-
-        // دنباله شعله‌های آتش نارنجی و زرد
-        for (let i = 0; i < 30; i++) {
-          const t = i / 30;
-          const x = t * 230;
-          const y = (Math.random() - 0.5) * (10 + t * 22);
-          const r = 12 + (1 - t) * 28;
-          const fGrad = mCtx.createRadialGradient(x, y, 1, x, y, r);
-          const alpha = (1 - t) * 0.75;
-          fGrad.addColorStop(0, `rgba(255, 240, 150, ${alpha})`);
-          fGrad.addColorStop(0.4, `rgba(255, 120, 20, ${alpha * 0.8})`);
-          fGrad.addColorStop(0.8, `rgba(180, 40, 10, ${alpha * 0.35})`);
-          fGrad.addColorStop(1, 'rgba(80, 15, 5, 0)');
-          mCtx.fillStyle = fGrad;
-          mCtx.beginPath();
-          mCtx.arc(x, y, r, 0, Math.PI * 2);
-          mCtx.fill();
-        }
-
-        // هسته سنگی گداخته شهاب‌سنگ
-        mCtx.beginPath();
-        const rockRadius = 38;
-        for (let a = 0; a < Math.PI * 2; a += 0.2) {
-          const jitter = 0.82 + hash2D(Math.cos(a) * 3, Math.sin(a) * 3) * 0.32;
-          const rx = Math.cos(a) * rockRadius * jitter * 1.25;
-          const ry = Math.sin(a) * rockRadius * jitter * 0.85;
-          if (a === 0) mCtx.moveTo(rx, ry);
-          else mCtx.lineTo(rx, ry);
-        }
-        mCtx.closePath();
-        const rockGrad = mCtx.createRadialGradient(-10, 0, 4, 5, 0, rockRadius * 1.3);
-        rockGrad.addColorStop(0, '#fff3b0');
-        rockGrad.addColorStop(0.35, '#ff7b1c');
-        rockGrad.addColorStop(0.7, '#6b2814');
-        rockGrad.addColorStop(1, '#261712');
-        mCtx.fillStyle = rockGrad;
-        mCtx.fill();
-
-        mCtx.restore();
-      }
-
-      // ۲- ج) بازسازی دقیق عکس آخر شما: چاله آسفالت شکسته، بتن فرو ریخته چپ، شعله‌های آتش و ماسک بدون بریدگی صاف
-      function buildCraterTexture() {
-        const size = 900;
-        textures.craterRim.width = size;
-        textures.craterRim.height = size;
-        textures.craterInnerMask.width = size;
-        textures.craterInnerMask.height = size;
-
-        const cCtx = textures.craterRim.getContext('2d');
-        const maskCtx = textures.craterInnerMask.getContext('2d');
-        const cx = size * 0.5, cy = size * 0.5;
-
-        // ۱. سایه نرم بیرونی روی سنگ‌فرش (بدون هیچ خط برش صاف در اطراف)
-        const outerShadow = cCtx.createRadialGradient(cx, cy, size * 0.22, cx, cy, size * 0.48);
-        outerShadow.addColorStop(0, 'rgba(10, 10, 12, 0.98)');
-        outerShadow.addColorStop(0.65, 'rgba(22, 20, 18, 0.92)');
-        outerShadow.addColorStop(0.84, 'rgba(35, 32, 28, 0.55)');
-        outerShadow.addColorStop(1, 'rgba(0, 0, 0, 0)');
-        cCtx.fillStyle = outerShadow;
-        cCtx.beginPath();
-        cCtx.arc(cx, cy, size * 0.48, 0, Math.PI * 2);
-        cCtx.fill();
-
-        // ۲. لبه نامنظم آسفالت شکسته و خاکستر اطراف دهانه
-        const imgData = cCtx.getImageData(0, 0, size, size);
-        const data = imgData.data;
-
-        for (let y = 0; y < size; y++) {
-          for (let x = 0; x < size; x++) {
-            const dx = (x - cx) / (size * 0.5);
-            const dy = (y - cy) / (size * 0.5);
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            const angle = Math.atan2(dy, dx);
-
-            const n1 = fbm(x * 0.015, y * 0.015, 5);
-            const n2 = fbm(x * 0.06, y * 0.06, 4);
-            const rimOuter = 0.82 + (n1 - 0.5) * 0.22;
-            const rimInner = 0.54 + (n1 - 0.5) * 0.16;
-
-            const idx = (y * size + x) * 4;
-
-            if (dist < rimOuter && dist >= rimInner) {
-              // بافت سنگ، آسفالت خردشده و خاک روی لبه گودال
-              const t = (dist - rimInner) / (rimOuter - rimInner);
-              const edgeFade = t > 0.72 ? Math.max(0, 1 - (t - 0.72) / 0.28) : 1.0;
-
-              // روشن‌تر بودن بخش چپ و پایین مطابق عکس سوم شما
-              const directionalLight = (dx < 0 && dy > -0.2) ? 1.25 : 0.75;
-              const pebbleGrain = n2 > 0.58 ? 1.35 : (n2 < 0.35 ? 0.55 : 0.95);
-              const baseTone = (52 + n1 * 48) * directionalLight * pebbleGrain;
-
-              data[idx]     = Math.min(255, baseTone * 1.04) | 0;
-              data[idx + 1] = Math.min(255, baseTone * 0.98) | 0;
-              data[idx + 2] = Math.min(255, baseTone * 0.91) | 0;
-              data[idx + 3] = Math.min(255, edgeFade * 255) | 0;
-            } else if (dist < rimInner) {
-              // حفره تاریک عمیق داخل گودال
-              const depthShade = Math.max(8, (dist / rimInner) * 28 * n1) | 0;
-              data[idx]     = depthShade;
-              data[idx + 1] = depthShade + 2;
-              data[idx + 2] = depthShade + 5;
-              data[idx + 3] = 250;
-            }
+          vec2 RGBtoUV(vec3 rgb) {
+            return vec2(
+              rgb.r * -0.169 + rgb.g * -0.331 + rgb.b *  0.500 + 0.5,
+              rgb.r *  0.500 + rgb.g * -0.419 + rgb.b * -0.081 + 0.5
+            );
           }
-        }
-        cCtx.putImageData(imgData, 0, 0);
 
-        // ۳. تخته بتن شکسته کرم‌رنگ در دیواره چپ و سنگ‌ریزه‌های واقعی لبه پایین (دقیقاً مطابق عکس سوم شما)
-        cCtx.save();
-        cCtx.fillStyle = '#9c8f7a';
-        cCtx.beginPath();
-        cCtx.moveTo(size * 0.20, size * 0.45);
-        cCtx.lineTo(size * 0.31, size * 0.49);
-        cCtx.lineTo(size * 0.34, size * 0.58);
-        cCtx.lineTo(size * 0.25, size * 0.61);
-        cCtx.lineTo(size * 0.19, size * 0.53);
-        cCtx.closePath();
-        cCtx.fill();
-        cCtx.strokeStyle = '#3a322a';
-        cCtx.lineWidth = 3;
-        cCtx.stroke();
-        cCtx.restore();
+          void main() {
+            vec4 texColor = texture2D(uTexture, vUv);
+            float chromaDist = distance(RGBtoUV(texColor.rgb), RGBtoUV(uKeyColor));
 
-        // ۴. قطعات برجسته آسفالت و قلوه‌سنگ در لبه پایینی و چپ چاله
-        for (let i = 0; i < 240; i++) {
-          const ang = Math.PI * 0.15 + Math.random() * Math.PI * 1.15; // تمرکز بیشتر روی لبه پایین و چپ
-          const rad = size * (0.28 + Math.random() * 0.13);
-          const rx = cx + Math.cos(ang) * rad;
-          const ry = cy + Math.sin(ang) * rad;
-          const rSize = 4 + Math.random() * 16;
+            float baseMask = chromaDist - uSimilarity;
+            float alpha = pow(clamp(baseMask / uSmoothness, 0.0, 1.0), 1.5);
 
-          cCtx.save();
-          cCtx.translate(rx, ry);
-          cCtx.rotate(Math.random() * Math.PI);
+            // حذف بازتاب رنگ سبز از لبه‌های کاراکتر
+            float spillVal = pow(clamp(baseMask / uSpill, 0.0, 1.0), 1.5);
+            float desat = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
+            vec3 cleanColor = mix(vec3(desat), texColor.rgb, spillVal);
 
-          // سایه زیر هر تکه سنگ
-          cCtx.fillStyle = 'rgba(10, 10, 10, 0.75)';
-          cCtx.fillRect(-rSize * 0.5 + 2, -rSize * 0.4 + 3, rSize, rSize * 0.8);
+            if (alpha < 0.02) discard;
+            gl_FragColor = vec4(cleanColor, alpha);
+          }
+        `
+      });
 
-          const tone = 65 + Math.floor(Math.random() * 85);
-          cCtx.fillStyle = `rgb(${tone}, ${tone - 4}, ${tone - 9})`;
-          cCtx.beginPath();
-          cCtx.moveTo(-rSize * 0.5, -rSize * 0.3);
-          cCtx.lineTo(rSize * 0.4, -rSize * 0.45);
-          cCtx.lineTo(rSize * 0.55, rSize * 0.3);
-          cCtx.lineTo(-rSize * 0.35, rSize * 0.45);
-          cCtx.closePath();
-          cCtx.fill();
-          cCtx.restore();
-        }
+      // ۴. ساخت مدل کاراکتر با ابعاد واقعی (ارتفاع ۲.۸ متر به همراه پرچم)
+      const characterGroup = new THREE.Group();
+      const charHeight = 2.8;
+      const charAspect = 336 / 592; // نسبت تصویر ویدیو
+      const charWidth = charHeight * charAspect;
 
-        // ۵. شعله‌های آتش نارنجی در لبه‌های داخلی گودال (مطابق عکس سوم شما)
-        const fireSpots = [
-          { a: 0.95, r: 0.29, s: 38 },
-          { a: 1.25, r: 0.28, s: 44 },
-          { a: 1.55, r: 0.29, s: 35 },
-          { a: 0.65, r: 0.30, s: 32 },
-          { a: -2.25, r: 0.28, s: 36 },
-          { a: -1.75, r: 0.29, s: 30 }
-        ];
-        fireSpots.forEach(fp => {
-          const fx = cx + Math.cos(fp.a) * (size * fp.r);
-          const fy = cy + Math.sin(fp.a) * (size * fp.r);
-          const fGrad = cCtx.createRadialGradient(fx, fy, 2, fx, fy, fp.s);
-          fGrad.addColorStop(0, 'rgba(255, 220, 110, 0.92)');
-          fGrad.addColorStop(0.45, 'rgba(255, 95, 15, 0.78)');
-          fGrad.addColorStop(1, 'rgba(180, 30, 0, 0)');
-          cCtx.fillStyle = fGrad;
-          cCtx.beginPath();
-          cCtx.arc(fx, fy, fp.s, 0, Math.PI * 2);
-          cCtx.fill();
-        });
+      const planeGeo = new THREE.PlaneGeometry(charWidth, charHeight);
+      // انتقال نقطه ثبات (Pivot) به کف پای کاراکتر
+      planeGeo.translate(0, charHeight / 2, 0);
+      const characterMesh = new THREE.Mesh(planeGeo, chromaKeyMaterial);
+      characterGroup.add(characterMesh);
 
-        // ۶. ساخت ماسک دهانه داخلی گودال (برای اینکه ریل و قطار مترو فقط درون گودال دیده شوند)
-        const maskGrad = maskCtx.createRadialGradient(cx, cy, size * 0.18, cx, cy, size * 0.29);
-        maskGrad.addColorStop(0, 'rgba(0, 0, 0, 1)');
-        maskGrad.addColorStop(0.82, 'rgba(0, 0, 0, 1)');
-        maskGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-        maskCtx.fillStyle = maskGrad;
-        maskCtx.beginPath();
-        maskCtx.arc(cx, cy, size * 0.29, 0, Math.PI * 2);
-        maskCtx.fill();
-      }
+      // ایجاد سایه طبیعی زیر پای کاراکتر روی سطح محیط
+      const shadowCanvas = document.createElement('canvas');
+      shadowCanvas.width = 128;
+      shadowCanvas.height = 128;
+      const sCtx = shadowCanvas.getContext('2d');
+      const grad = sCtx.createRadialGradient(64, 64, 8, 64, 64, 60);
+      grad.addColorStop(0, 'rgba(0, 0, 0, 0.55)');
+      grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+      sCtx.fillStyle = grad;
+      sCtx.fillRect(0, 0, 128, 128);
 
-      // ۲- د) بازسازی دقیق قطار متروی آبی-نقره‌ای با کولرهای سقفی و چراغ‌های جلو (مطابق عکس سوم شما)
-      function buildMetroTrainTexture() {
-        const w = 640, h = 240;
-        textures.metroTrain.width = w;
-        textures.metroTrain.height = h;
-        const tCtx = textures.metroTrain.getContext('2d');
+      const shadowTex = new THREE.CanvasTexture(shadowCanvas);
+      const shadowGeo = new THREE.PlaneGeometry(charWidth * 0.9, charWidth * 0.5);
+      shadowGeo.rotateX(-Math.PI / 2);
+      const shadowMat = new THREE.MeshBasicMaterial({
+        map: shadowTex,
+        transparent: true,
+        depthWrite: false
+      });
+      const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
+      shadowMesh.position.y = 0.01;
+      characterGroup.add(shadowMesh);
 
-        const cy = h * 0.5;
+      characterGroup.visible = false;
+      scene.add(characterGroup);
 
-        // پرتو نور چراغ‌های جلو روی ریل‌ها
-        const beamGrad = tCtx.createLinearGradient(w * 0.76, cy, w, cy);
-        beamGrad.addColorStop(0, 'rgba(255, 235, 190, 0.65)');
-        beamGrad.addColorStop(1, 'rgba(255, 235, 190, 0)');
-        tCtx.fillStyle = beamGrad;
-        tCtx.beginPath();
-        tCtx.moveTo(w * 0.75, cy - 42);
-        tCtx.lineTo(w, cy - 90);
-        tCtx.lineTo(w, cy + 90);
-        tCtx.lineTo(w * 0.75, cy + 42);
-        tCtx.closePath();
-        tCtx.fill();
+      // ۵. اسکنر هوشمند محیط (تشخیص سطوح صاف، پیاده‌رو، خیابان و لبه پشت‌بام)
+      const scanCanvas = document.createElement('canvas');
+      const scanWidth = 96;
+      const scanHeight = 96;
+      scanCanvas.width = scanWidth;
+      scanCanvas.height = scanHeight;
+      const scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
 
-        // سایه زیر بدنه قطار
-        tCtx.fillStyle = 'rgba(0, 0, 0, 0.72)';
-        tCtx.beginPath();
-        tCtx.roundRect(30, cy - 64, w * 0.74, 128, [18, 42, 42, 18]);
-        tCtx.fill();
-
-        // بدنه اصلی متالیک نقره‌ای-آبی تیره
-        const bodyGrad = tCtx.createLinearGradient(0, cy - 58, 0, cy + 58);
-        bodyGrad.addColorStop(0, '#1e3f66');
-        bodyGrad.addColorStop(0.16, '#396ea8');
-        bodyGrad.addColorStop(0.28, '#7c8b99');
-        bodyGrad.addColorStop(0.5, '#9aa8b5');
-        bodyGrad.addColorStop(0.72, '#6d7c8a');
-        bodyGrad.addColorStop(0.86, '#2b588a');
-        bodyGrad.addColorStop(1, '#162d47');
-
-        tCtx.fillStyle = bodyGrad;
-        tCtx.beginPath();
-        tCtx.roundRect(36, cy - 56, w * 0.72, 112, [14, 38, 38, 14]);
-        tCtx.fill();
-
-        // شیشه دودی جلو (کابین راهبر)
-        tCtx.fillStyle = '#18222c';
-        tCtx.beginPath();
-        tCtx.roundRect(w * 0.65, cy - 44, 62, 88, [6, 26, 26, 6]);
-        tCtx.fill();
-
-        // بازتاب شیشه جلو
-        tCtx.fillStyle = 'rgba(150, 195, 235, 0.25)';
-        tCtx.beginPath();
-        tCtx.moveTo(w * 0.67, cy - 38);
-        tCtx.lineTo(w * 0.73, cy - 28);
-        tCtx.lineTo(w * 0.71, cy + 32);
-        tCtx.lineTo(w * 0.66, cy + 36);
-        tCtx.closePath();
-        tCtx.fill();
-
-        // یونیت‌های کولر و تهویه روی سقف قطار (دقیقاً مطابق عکس سوم شما)
-        function drawRoofUnit(ux) {
-          tCtx.fillStyle = '#556270';
-          tCtx.strokeStyle = '#2d3640';
-          tCtx.lineWidth = 2;
-          tCtx.beginPath();
-          tCtx.roundRect(ux, cy - 30, 88, 60, 6);
-          tCtx.fill();
-          tCtx.stroke();
-
-          // دو فن دایره‌ای تیره داخل هر کولر سقفی
-          [ux + 26, ux + 62].forEach(fx => {
-            tCtx.fillStyle = '#222a33';
-            tCtx.beginPath();
-            tCtx.arc(fx, cy, 14, 0, Math.PI * 2);
-            tCtx.fill();
-          });
-        }
-        drawRoofUnit(w * 0.46);
-        drawRoofUnit(w * 0.22);
-
-        // چراغ‌های روشن جلو در دو طرف دماغه قطار
-        [cy - 36, cy + 36].forEach(ly => {
-          const hlGrad = tCtx.createRadialGradient(w * 0.74, ly, 1, w * 0.74, ly, 16);
-          hlGrad.addColorStop(0, '#ffffff');
-          hlGrad.addColorStop(0.4, '#ffd27d');
-          hlGrad.addColorStop(1, 'rgba(255, 140, 40, 0)');
-          tCtx.fillStyle = hlGrad;
-          tCtx.beginPath();
-          tCtx.arc(w * 0.74, ly, 16, 0, Math.PI * 2);
-          tCtx.fill();
-        });
-      }
-
-      // =========================================================================
-      // ۳. سنتز صدای واقعی و غیرفانتزی (غرش فرکانس پایین زمین‌لرزه و ریل مترو)
-      // =========================================================================
-      let audioCtx = null;
-      let subwaySoundNode = null;
-      let subwayGainNode = null;
-
-      function initAudio() {
-        if (audioCtx) {
-          if (audioCtx.state === 'suspended') audioCtx.resume();
-          return;
-        }
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextClass) return;
-        audioCtx = new AudioContextClass();
-
-        // ایجاد بافر نویز طبیعی برای صدای غرش برخورد و صدای ریل مترو
-        const bufferSize = audioCtx.sampleRate * 3;
-        const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
-        const out = noiseBuffer.getChannelData(0);
-        let lastOut = 0.0;
-        for (let i = 0; i < bufferSize; i++) {
-          const white = Math.random() * 2 - 1;
-          out[i] = (lastOut + (0.02 * white)) / 1.02; // صدای Brown Noise عمیق و سینمایی
-          lastOut = out[i];
-          out[i] *= 3.5;
-        }
-
-        // صدای مداوم عبور مترو در عمق زمین (فقط در حالت رو به پایین شنیده می‌شود)
-        subwaySoundNode = audioCtx.createBufferSource();
-        subwaySoundNode.buffer = noiseBuffer;
-        subwaySoundNode.loop = true;
-
-        const filter = audioCtx.createBiquadFilter();
-        filter.type = 'bandpass';
-        filter.frequency.value = 115;
-        filter.Q.value = 1.4;
-
-        subwayGainNode = audioCtx.createGain();
-        subwayGainNode.gain.value = 0.0001;
-
-        subwaySoundNode.connect(filter);
-        filter.connect(subwayGainNode);
-        subwayGainNode.connect(audioCtx.destination);
-        subwaySoundNode.start(0);
-      }
-
-      function playRealisticImpactSound() {
-        initAudio();
-        if (!audioCtx) return;
-
-        const now = audioCtx.currentTime;
-        const bufferSize = audioCtx.sampleRate * 2.5;
-        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
-        const data = buffer.getChannelData(0);
-        let b0 = 0;
-        for (let i = 0; i < bufferSize; i++) {
-          const w = Math.random() * 2 - 1;
-          b0 = 0.98 * b0 + 0.02 * w;
-          data[i] = b0 * 4.0 * Math.exp(-i / (audioCtx.sampleRate * 0.65));
-        }
-
-        const noise = audioCtx.createBufferSource();
-        noise.buffer = buffer;
-
-        const lowpass = audioCtx.createBiquadFilter();
-        lowpass.type = 'lowpass';
-        lowpass.frequency.setValueAtTime(160, now);
-        lowpass.frequency.exponentialRampToValueAtTime(38, now + 2.2);
-
-        const gain = audioCtx.createGain();
-        gain.gain.setValueAtTime(1.2, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 2.4);
-
-        noise.connect(lowpass);
-        lowpass.connect(gain);
-        gain.connect(audioCtx.destination);
-        noise.start(now);
-      }
-
-      window.addEventListener('touchstart', initAudio, { passive: true });
-      window.addEventListener('pointerdown', initAudio, { passive: true });
-
-      // =========================================================================
-      // ۴. سیستم ژیروسکوپ و ردیابی نوری سطح زمین (Optical Flow Ground Tracker)
-      // =========================================================================
-      const trackCanvas = document.createElement('canvas');
-      trackCanvas.width = 64;
-      trackCanvas.height = 64;
-      const trackCtx = trackCanvas.getContext('2d', { willReadFrequently: true });
-      let prevLuma = null;
-
-      const cameraState = {
-        pitch: 0,       // > 22: آسمان (نمای بالا) | -18 تا 22: روبرو (نمای وسط) | < -18: زمین (نمای پایین)
-        yaw: 0,
-        flowX: 0,
-        flowY: 0
-      };
+      let devicePitch = 0; // زاویه بالا/پایین گوشی (به رادیان)
+      let deviceRoll = 0;
+      let deviceYaw = 0;
+      let hasSensor = false;
 
       window.addEventListener('deviceorientation', (e) => {
-        if (e.beta === null) return;
-        // وقتی گوشی عمودی رو به روبروست beta حدود 75 تا 85 درجه است -> pitch = 0
-        // وقتی گوشی رو به آسمان گرفته شود beta بزرگتر از 100 می‌شود -> pitch > +20
-        // وقتی گوشی رو به زمین خم شود beta کمتر از 55 می‌شود -> pitch < -20
-        const targetPitch = e.beta - 78;
-        const targetYaw = e.gamma || 0;
-        cameraState.pitch += (targetPitch - cameraState.pitch) * 0.16;
-        cameraState.yaw += (targetYaw - cameraState.yaw) * 0.16;
-      }, true);
+        if (e.beta !== null && e.gamma !== null) {
+          hasSensor = true;
+          // تبدیل زاویه گوشی به زاویه دید دوربین
+          const betaRad = THREE.MathUtils.degToRad(e.beta);
+          const gammaRad = THREE.MathUtils.degToRad(e.gamma);
+          const alphaRad = THREE.MathUtils.degToRad(e.alpha || 0);
 
-      function updateOpticalFlow() {
-        if (video.readyState < 2) return;
-        trackCtx.drawImage(video, 0, 0, 64, 64);
-        const img = trackCtx.getImageData(0, 0, 64, 64).data;
-        const currLuma = new Float32Array(64 * 64);
-
-        for (let i = 0; i < 64 * 64; i++) {
-          const k = i * 4;
-          currLuma[i] = 0.299 * img[k] + 0.587 * img[k + 1] + 0.114 * img[k + 2];
+          devicePitch = betaRad - Math.PI / 2;
+          deviceRoll = gammaRad;
+          deviceYaw = alphaRad;
         }
+      });
 
-        if (prevLuma) {
-          let bestDx = 0, bestDy = 0, minDiff = Infinity;
-          for (let dy = -3; dy <= 3; dy++) {
-            for (let dx = -3; dx <= 3; dx++) {
-              let sad = 0;
-              for (let y = 20; y < 48; y += 2) {
-                for (let x = 16; x < 48; x += 2) {
-                  sad += Math.abs(currLuma[y * 64 + x] - prevLuma[(y + dy) * 64 + (x + dx)]);
-                }
-              }
-              if (sad < minDiff) {
-                minDiff = sad;
-                bestDx = dx;
-                bestDy = dy;
-              }
+      // تابع اسکن تصویر دوربین برای یافتن بهترین سطح افقی (پیاده‌رو/خیابان یا لبه پشت‌بام)
+      function scanEnvironmentForSurface(preferredNormalizedX = null, preferredNormalizedY = null) {
+        if (cameraVideo.readyState < 2) return null;
+
+        scanCtx.drawImage(cameraVideo, 0, 0, scanWidth, scanHeight);
+        const imgData = scanCtx.getImageData(0, 0, scanWidth, scanHeight).data;
+
+        let bestScore = -1;
+        let bestX = scanWidth / 2;
+        let bestY = Math.floor(scanHeight * 0.72);
+
+        const minY = Math.floor(scanHeight * 0.20);
+        const maxY = Math.floor(scanHeight * 0.88);
+        const minX = Math.floor(scanWidth * 0.20);
+        const maxX = Math.floor(scanWidth * 0.80);
+
+        for (let y = minY; y < maxY; y += 2) {
+          for (let x = minX; x < maxX; x += 2) {
+            const idx = (y * scanWidth + x) * 4;
+            const idxAbove = ((y - 2) * scanWidth + x) * 4;
+            const idxBelow = ((y + 2) * scanWidth + x) * 4;
+            const idxLeft = (y * scanWidth + (x - 2)) * 4;
+            const idxRight = (y * scanWidth + (x + 2)) * 4;
+
+            const lum = 0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2];
+            const lumAbove = 0.299 * imgData[idxAbove] + 0.587 * imgData[idxAbove + 1] + 0.114 * imgData[idxAbove + 2];
+            const lumBelow = 0.299 * imgData[idxBelow] + 0.587 * imgData[idxBelow + 1] + 0.114 * imgData[idxBelow + 2];
+            const lumLeft = 0.299 * imgData[idxLeft] + 0.587 * imgData[idxLeft + 1] + 0.114 * imgData[idxLeft + 2];
+            const lumRight = 0.299 * imgData[idxRight] + 0.587 * imgData[idxRight + 1] + 0.114 * imgData[idxRight + 2];
+
+            // لبه‌های افقی قوی و پیوستگی افقی (مشخصه لبه پشت‌بام، جدول خیابان یا کف پیاده‌رو)
+            const verticalGrad = Math.abs(lumAbove - lumBelow);
+            const horizontalContinuity = 255 - Math.abs(lumLeft - lumRight);
+
+            let score = verticalGrad * 0.6 + horizontalContinuity * 0.4;
+
+            // اولویت به مرکز تصویر یا نقطه لمس شده توسط کاربر
+            const normX = x / scanWidth;
+            const normY = y / scanHeight;
+            if (preferredNormalizedX !== null && preferredNormalizedY !== null) {
+              const distToTap = Math.hypot(normX - preferredNormalizedX, normY - preferredNormalizedY);
+              score *= Math.max(0.1, 1.5 - distToTap * 3.0);
+            } else {
+              const centerBias = 1.0 - Math.abs(normX - 0.5) * 0.8;
+              score *= centerBias;
+            }
+
+            if (score > bestScore) {
+              bestScore = score;
+              bestX = x;
+              bestY = y;
             }
           }
-          cameraState.flowX = (cameraState.flowX - bestDx * (canvas.width / 64) * 0.5) * 0.94;
-          cameraState.flowY = (cameraState.flowY - bestDy * (canvas.height / 64) * 0.5) * 0.94;
         }
-        prevLuma = currLuma;
+
+        return {
+          ndcX: (bestX / scanWidth) * 2 - 1,
+          ndcY: -(bestY / scanHeight) * 2 + 1,
+          screenRatioY: bestY / scanHeight
+        };
       }
 
-      // =========================================================================
-      // ۵. مدیریت ۳ نمای سناریو:
-      //    - نمای بالا (آسمان): شهاب‌سنگ‌های عکس اول شما
-      //    - نمای وسط (روبرو): سقوط تک‌باره شهاب‌سنگ به زمین + انیمیشن دود حجمی (بدون چاله!)
-      //    - نمای پایین (زمین): قفل شدن چاله روی زمین + عبور طبیعی قطار مترو (عکس آخر شما)
-      // =========================================================================
-      const scene = {
-        skyMeteors: [
-          { x: 0.78, y: 0.14, speed: 0.16, scale: 0.42 },
-          { x: 0.56, y: 0.04, speed: 0.14, scale: 0.36 }
-        ],
-        middleMeteorStarted: false,
-        middleMeteorImpacted: false,
-        middleMeteorProgress: 0,
-        impactTimestamp: 0,
-        cameraShake: 0,
-        smokePlumes: [],
-        sparks: [],
-        metroProgress: -480
-      };
+      // ۶. محاسبه موقعیت سه‌بعدی و مقیاس واقعی متناسب با فاصله در محیط
+      const targetPosition = new THREE.Vector3(0, 0, -5);
+      let isPlaced = false;
 
-      function addSmokePlume(x, y, baseSize, vy, darkFactor) {
-        scene.smokePlumes.push({
-          x: x + (Math.random() - 0.5) * 36,
-          y: y + (Math.random() - 0.5) * 14,
-          vx: (Math.random() - 0.5) * 18,
-          vy: -vy * (0.8 + Math.random() * 0.4),
-          size: baseSize,
-          growth: 38 + Math.random() * 32,
-          alpha: 0.82,
-          fadeSpeed: 0.14 + Math.random() * 0.08,
-          rotation: Math.random() * Math.PI * 2,
-          rotSpeed: (Math.random() - 0.5) * 0.45,
-          dark: darkFactor
-        });
-      }
+      function placeCharacterSmartly(prefX = null, prefY = null) {
+        const surface = scanEnvironmentForSurface(prefX, prefY);
+        if (!surface) return;
 
-      function addImpactSparks(x, y, count) {
-        for (let i = 0; i < count; i++) {
-          const angle = -Math.PI * (0.12 + Math.random() * 0.76);
-          const speed = 140 + Math.random() * 340;
-          scene.sparks.push({
-            x,
-            y,
-            vx: Math.cos(angle) * speed,
-            vy: Math.sin(angle) * speed,
-            life: 0.45 + Math.random() * 0.55,
-            maxLife: 1.0,
-            size: 2.5 + Math.random() * 4.5
-          });
+        // تخمین فاصله واقعی (بر حسب متر) بر اساس پرسپکتیو عمودی و زاویه دوربین
+        // نقاط پایین‌تر تصویر نزدیک‌تر (پیاده‌رو: ۳ تا ۶ متر) و نقاط بالاتر دورتر (خیابان یا پشت‌بام: ۱۰ تا ۳۵ متر) هستند
+        const verticalFactor = Math.clamp
+          ? Math.clamp(surface.screenRatioY, 0.15, 0.92)
+          : Math.max(0.15, Math.min(0.92, surface.screenRatioY));
+
+        let estimatedDistance;
+        if (verticalFactor > 0.55) {
+          // ناحیه زمین، پیاده‌رو یا خیابان نزدیک
+          estimatedDistance = 3.2 + (1.0 - verticalFactor) * 14.0;
+        } else {
+          // ناحیه دورتر یا ارتفاع (مانند پشت‌بام ساختمان‌ها)
+          estimatedDistance = 10.0 + (0.55 - verticalFactor) * 45.0;
+        }
+
+        // تبدیل نقطه تشخیص داده شده روی صفحه به مختصات سه‌بعدی جهان واقعی
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(surface.ndcX, surface.ndcY), camera);
+
+        const worldPos = new THREE.Vector3();
+        raycaster.ray.at(estimatedDistance, worldPos);
+
+        targetPosition.copy(worldPos);
+        if (!isPlaced) {
+          characterGroup.position.copy(targetPosition);
+          characterGroup.visible = true;
+          isPlaced = true;
         }
       }
 
-      // کانوس ترکیبی برای رندر کردن ریل‌ها، قطار مترو و دود داخل دهانه چاله
-      const pitCompCanvas = document.createElement('canvas');
-      pitCompCanvas.width = 900;
-      pitCompCanvas.height = 900;
-      const pitCtx = pitCompCanvas.getContext('2d');
+      // اسکن اولیه خودکار به محض آماده شدن تصویر دوربین
+      const scanInterval = setInterval(() => {
+        if (!isPlaced && cameraVideo.readyState >= 2) {
+          placeCharacterSmartly();
+        }
+      }, 400);
 
-      const holeClipCanvas = document.createElement('canvas');
-      holeClipCanvas.width = 900;
-      holeClipCanvas.height = 900;
-      const holeClipCtx = holeClipCanvas.getContext('2d');
+      // امکان جابجایی هوشمند کاراکتر به هر نقطه دلخواه (مثلاً روی یک پشت‌بام خاص یا پیاده‌رو) با لمس صفحه
+      window.addEventListener('pointerdown', (event) => {
+        const normX = event.clientX / window.innerWidth;
+        const normY = event.clientY / window.innerHeight;
+        placeCharacterSmartly(normX, normY);
+      });
 
-      function resize() {
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        canvas.width = window.innerWidth * dpr;
-        canvas.height = window.innerHeight * dpr;
-      }
-      window.addEventListener('resize', resize);
-      resize();
+      // ۷. حلقه رندر بلادرنگ و هماهنگی با چرخش گوشی
+      const clock = new THREE.Clock();
 
-      buildSmokeSprite();
-      buildMeteorCutout();
-      buildCraterTexture();
-      buildMetroTrainTexture();
-      launchCamera();
-
-      let prevTime = performance.now();
-
-      function animate(now) {
+      function animate() {
         requestAnimationFrame(animate);
-        const dt = Math.min((now - prevTime) / 1000, 0.05);
-        prevTime = now;
 
-        updateOpticalFlow();
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const delta = clock.getDelta();
 
-        const w = canvas.width;
-        const h = canvas.height;
-        const minDim = Math.min(w, h);
+        // اعمال چرخش ژیروسکوپ به دوربین سه‌بعدی در صورت وجود سنسور
+        if (hasSensor) {
+          camera.rotation.order = 'YXZ';
+          camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, devicePitch, 0.15);
+          camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, -deviceYaw * 0.25, 0.15);
+          camera.rotation.z = THREE.MathUtils.lerp(camera.rotation.z, -deviceRoll * 0.15, 0.15);
+        }
 
-        ctx.save();
-        // اعمال لرزش سینمایی دوربین در لحظه برخورد شهاب‌سنگ
-        if (scene.cameraShake > 0.2) {
-          ctx.translate(
-            (Math.random() - 0.5) * scene.cameraShake,
-            (Math.random() - 0.5) * scene.cameraShake
+        if (isPlaced) {
+          // حرکت نرم کاراکتر به نقطه اسکن شده
+          characterGroup.position.lerp(targetPosition, Math.min(1, delta * 6));
+
+          // چرخش همیشگی صفحه کاراکتر به سمت دوربین (Billboarding افقی) تا طبیعی دیده شود
+          const lookTarget = new THREE.Vector3(
+            camera.position.x,
+            characterGroup.position.y,
+            camera.position.z
           );
-          scene.cameraShake *= 0.88;
+          characterGroup.lookAt(lookTarget);
         }
 
-        // مختصات نقطه قفل شده روی سطح زمین (ترکیب ژیروسکوپ و ردیابی تصویر دوربین)
-        const groundAnchorX = w * 0.5 + cameraState.flowX - cameraState.yaw * (w * 0.01);
-        const groundHorizonY = h * 0.74 + cameraState.flowY;
-
-        // تشخیص زاویه دوربین:
-        // ۱. زاویه رو به آسمان (pitch > 20)
-        const skyWeight = Math.max(0, Math.min(1, (cameraState.pitch - 18) / 18));
-        // ۲. زاویه رو به پایین روی زمین (pitch < -16)
-        const groundDownWeight = Math.max(0, Math.min(1, (-cameraState.pitch - 15) / 28));
-        // ۳. زاویه روبرو / حالت وسط
-        const frontWeight = Math.max(0, 1 - Math.max(skyWeight, groundDownWeight));
-
-        // =====================================================================
-        // بخش اول: نمای رو به بالا (آسمان) -> نمایش شهاب‌سنگ‌های عکس اول شما
-        // =====================================================================
-        if (skyWeight > 0.02) {
-          ctx.save();
-          ctx.globalAlpha = skyWeight;
-          scene.skyMeteors.forEach(m => {
-            m.x -= dt * m.speed;
-            m.y += dt * m.speed * 1.15;
-            if (m.x < -0.2 || m.y > 0.85) {
-              m.x = 0.85 + Math.random() * 0.25;
-              m.y = -0.15 + Math.random() * 0.15;
-            }
-            const mx = m.x * w;
-            const my = m.y * h;
-            const mSize = minDim * m.scale;
-            ctx.drawImage(textures.meteorCutout, mx - mSize * 0.5, my - mSize * 0.5, mSize, mSize);
-          });
-          ctx.restore();
-        }
-
-        // =====================================================================
-        // بخش دوم: نمای روبرو (حالت وسط) -> سقوط شهاب‌سنگ (فقط ۱ بار) و بلند شدن دود
-        //          ** هیچ چاله‌ای در این حالت نمایش داده نمی‌شود **
-        // =====================================================================
-        if (!scene.middleMeteorStarted && frontWeight > 0.3 && now > 1000) {
-          scene.middleMeteorStarted = true;
-          scene.middleMeteorProgress = 0;
-        }
-
-        if (scene.middleMeteorStarted && !scene.middleMeteorImpacted) {
-          scene.middleMeteorProgress += dt * 1.45;
-          const p = Math.min(1, scene.middleMeteorProgress);
-
-          const startX = w * 0.88;
-          const startY = -h * 0.12;
-          const curX = startX + (groundAnchorX - startX) * p;
-          const curY = startY + (groundHorizonY - startY) * p;
-          const mSize = minDim * (0.28 + p * 0.24);
-
-          ctx.save();
-          ctx.drawImage(textures.meteorCutout, curX - mSize * 0.5, curY - mSize * 0.5, mSize, mSize);
-          ctx.restore();
-
-          // لحظه برخورد با زمین (فقط یک بار اتفاق می‌افتد)
-          if (scene.middleMeteorProgress >= 1.0) {
-            scene.middleMeteorImpacted = true;
-            scene.impactTimestamp = now;
-            scene.cameraShake = minDim * 0.065;
-            playRealisticImpactSound();
-
-            // ایجاد ستون دود انفجار اولیه و پرتاب جرقه‌ها در نمای روبرو
-            for (let i = 0; i < 18; i++) {
-              addSmokePlume(
-                groundAnchorX,
-                groundHorizonY,
-                minDim * (0.14 + Math.random() * 0.14),
-                65 + Math.random() * 95,
-                0.85
-              );
-            }
-            addImpactSparks(groundAnchorX, groundHorizonY, 36);
-          }
-        }
-
-        // افکت انفجار و انیمیشن دود حجمی پس از برخورد شهاب‌سنگ
-        if (scene.middleMeteorImpacted) {
-          const elapsed = (now - scene.impactTimestamp) / 1000;
-
-          // فلاش نوری و موج انفجار لحظه برخورد
-          if (elapsed < 0.42) {
-            const flashAlpha = (1 - elapsed / 0.42) * 0.88;
-            const flashGrad = ctx.createRadialGradient(
-              groundAnchorX, groundHorizonY, 10,
-              groundAnchorX, groundHorizonY, Math.max(w, h) * 0.85
-            );
-            flashGrad.addColorStop(0, `rgba(255, 245, 210, ${flashAlpha})`);
-            flashGrad.addColorStop(0.3, `rgba(255, 130, 30, ${flashAlpha * 0.65})`);
-            flashGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-            ctx.fillStyle = flashGrad;
-            ctx.fillRect(0, 0, w, h);
-          }
-
-          // در نمای روبرو، درخشش کانون داغ روی سطح زمین (بدون نمایش چاله معلق) و تولید پیوسته دود
-          if (frontWeight > 0.05) {
-            ctx.save();
-            ctx.globalAlpha = frontWeight;
-
-            // هاله حرارت و سوختگی تخت روی سطح زمین در نقطه برخورد
-            constemberAlpha = Math.max(0.15, Math.min(0.75, 1 - elapsed * 0.04));
-            const scorchGrad = ctx.createRadialGradient(
-              groundAnchorX, groundHorizonY, 4,
-              groundAnchorX, groundHorizonY, minDim * 0.22
-            );
-            scorchGrad.addColorStop(0, `rgba(255, 110, 20, ${emberAlpha})`);
-            scorchGrad.addColorStop(0.45, `rgba(40, 25, 18, ${emberAlpha * 0.7})`);
-            scorchGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-
-            ctx.save();
-            ctx.translate(groundAnchorX, groundHorizonY);
-            ctx.scale(1, 0.28); // کاملاً خوابیده روی افق زمین
-            ctx.fillStyle = scorchGrad;
-            ctx.beginPath();
-            ctx.arc(0, 0, minDim * 0.22, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.restore();
-
-            ctx.restore();
-
-            // تولید پیوسته دود طبیعی از محل برخورد در نمای روبرو
-            if (Math.random() < 0.45) {
-              addSmokePlume(
-                groundAnchorX,
-                groundHorizonY,
-                minDim * (0.12 + Math.random() * 0.1),
-                45 + Math.random() * 55,
-                0.9
-              );
-            }
-          }
-
-          // ===================================================================
-          // بخش سوم: نمای رو به پایین (روی زمین) -> نمایش چاله و عبور مترو (عکس آخر شما)
-          //          فقط وقتی دوربین به سمت زمین خم شود ظاهر و روی زمین قفل می‌شود
-          // ===================================================================
-          if (groundDownWeight > 0.03) {
-            const craterY = h * 0.55 + cameraState.flowY + (1 - groundDownWeight) * (h * 0.18);
-            const craterDrawSize = minDim * 0.92;
-            const perspectiveTiltY = 0.58 + groundDownWeight * 0.36;
-
-            // تنظیم صدای غرش مترو متناسب با زاویه نگاه به داخل چاله
-            if (subwayGainNode && audioCtx) {
-              subwayGainNode.gain.setTargetAtTime(groundDownWeight * 0.65, audioCtx.currentTime, 0.1);
-            }
-
-            // حرکت طبیعی قطار مترو روی ریل‌ها
-            scene.metroProgress += dt * 310;
-            if (scene.metroProgress > 680) {
-              scene.metroProgress = -680;
-            }
-
-            // ۱. رسم ریل‌ها و قطار مترو درون دهانه گودال (محدود شده به ماسک داخلی چاله)
-            holeClipCtx.clearRect(0, 0, 900, 900);
-            holeClipCtx.save();
-            holeClipCtx.translate(450, 465);
-            holeClipCtx.rotate(0.88); // زاویه مورب ریل مترو دقیقاً مطابق عکس سوم شما
-
-            // کف تاریک تونل و تراورس‌های ریل
-            holeClipCtx.fillStyle = '#0c0f14';
-            holeClipCtx.fillRect(-500, -220, 1000, 440);
-
-            holeClipCtx.strokeStyle = '#1e242b';
-            holeClipCtx.lineWidth = 6;
-            for (let sx = -450; sx <= 450; sx += 28) {
-              holeClipCtx.beginPath();
-              holeClipCtx.moveTo(sx, -75);
-              holeClipCtx.lineTo(sx, 75);
-              holeClipCtx.stroke();
-            }
-
-            // دو خط ریل فولادی براق
-            holeClipCtx.strokeStyle = '#5c6b7a';
-            holeClipCtx.lineWidth = 4.5;
-            [-42, 42].forEach(ry => {
-              holeClipCtx.beginPath();
-              holeClipCtx.moveTo(-500, ry);
-              holeClipCtx.lineTo(500, ry);
-              holeClipCtx.stroke();
-            });
-
-            // رسم قطار مترو در حال عبور
-            holeClipCtx.drawImage(textures.metroTrain, scene.metroProgress - 320, -110, 640, 220);
-
-            // لایه مه و دود رقیق روی قطار در عمق چاله (مطابق عکس سوم شما)
-            const innerFog = holeClipCtx.createRadialGradient(0, 0, 40, 0, 0, 320);
-            innerFog.addColorStop(0, 'rgba(65, 70, 75, 0.28)');
-            innerFog.addColorStop(1, 'rgba(10, 12, 15, 0.65)');
-            holeClipCtx.fillStyle = innerFog;
-            holeClipCtx.fillRect(-450, -450, 900, 900);
-            holeClipCtx.restore();
-
-            // برش تصویر تونل و مترو با ماسک داخلی چاله تا بیرون از گودال نزند
-            holeClipCtx.globalCompositeOperation = 'destination-in';
-            holeClipCtx.drawImage(textures.craterInnerMask, 0, 0);
-            holeClipCtx.globalCompositeOperation = 'source-over';
-
-            // ۲. ترکیب لبه سنگی چاله و تونل مترو
-            pitCtx.clearRect(0, 0, 900, 900);
-            pitCtx.drawImage(textures.craterRim, 0, 0);
-            pitCtx.drawImage(holeClipCanvas, 0, 0);
-
-            // ۳. رسم نهایی چاله روی سطح زمین واقعی
-            ctx.save();
-            ctx.globalAlpha = groundDownWeight;
-            ctx.translate(groundAnchorX, craterY);
-            ctx.scale(1, perspectiveTiltY);
-            ctx.drawImage(
-              pitCompCanvas,
-              -craterDrawSize * 0.5,
-              -craterDrawSize * 0.5,
-              craterDrawSize,
-              craterDrawSize
-            );
-            ctx.restore();
-          } else if (subwayGainNode && audioCtx) {
-            subwayGainNode.gain.setTargetAtTime(0.0001, audioCtx.currentTime, 0.15);
-          }
-
-          // رندر ذرات دود حجمی و جرقه‌ها (برای نمای روبرو)
-          for (let i = scene.smokePlumes.length - 1; i >= 0; i--) {
-            const p = scene.smokePlumes[i];
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
-            p.size += p.growth * dt;
-            p.alpha -= p.fadeSpeed * dt;
-            p.rotation += p.rotSpeed * dt;
-
-            if (p.alpha <= 0.01) {
-              scene.smokePlumes.splice(i, 1);
-              continue;
-            }
-
-            ctx.save();
-            ctx.globalAlpha = Math.max(0, p.alpha * frontWeight);
-            ctx.translate(p.x, p.y);
-            ctx.rotate(p.rotation);
-            ctx.drawImage(textures.smokeSprite, -p.size * 0.5, -p.size * 0.5, p.size, p.size);
-            ctx.restore();
-          }
-
-          for (let i = scene.sparks.length - 1; i >= 0; i--) {
-            const sp = scene.sparks[i];
-            sp.x += sp.vx * dt;
-            sp.y += sp.vy * dt;
-            sp.vy += 420 * dt; // جاذبه روی جرقه‌های پرتاب‌شده
-            sp.life -= dt;
-
-            if (sp.life <= 0) {
-              scene.sparks.splice(i, 1);
-              continue;
-            }
-
-            ctx.save();
-            ctx.globalAlpha = Math.max(0, (sp.life / sp.maxLife) * frontWeight);
-            ctx.fillStyle = '#ffae38';
-            ctx.beginPath();
-            ctx.arc(sp.x, sp.y, sp.size, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.restore();
-          }
-        }
-
-        ctx.restore();
+        renderer.render(scene, camera);
       }
 
-      requestAnimationFrame(animate);
+      animate();
+
+      // تطبیق خودکار با تغییر ابعاد صفحه
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
     })();
   </script>
 </body>
