@@ -34,7 +34,7 @@
       width: 100vw;
       height: 100vh;
       z-index: 2;
-      pointer-events: auto;
+      pointer-events: none;
     }
     #chroma-video {
       display: none;
@@ -43,16 +43,15 @@
 </head>
 <body>
 
-  <!-- تصویر زنده دوربین -->
+  <!-- دوربین مستقیم و خودکار -->
   <video id="camera-feed" autoplay playsinline muted></video>
 
-  <!-- ویدیوی کاراکتر پرده سبز -->
+  <!-- ویدیوی پرده سبز (کاملاً بی‌صدا و لوپ) -->
   <video id="chroma-video" src="character.mp4" loop muted playsinline autoplay crossorigin="anonymous"></video>
 
-  <!-- بوم رندر سه بعدی واقعیت افزوده -->
+  <!-- بوم گرافیکی سه‌بعدی -->
   <canvas id="ar-canvas"></canvas>
 
-  <!-- کتابخانه Three.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 
   <script>
@@ -61,7 +60,7 @@
       const chromaVideo = document.getElementById('chroma-video');
       const canvas = document.getElementById('ar-canvas');
 
-      // ۱. باز شدن مستقیم و خودکار دوربین پشت
+      // ۱. اجرای خودکار دوربین پشت
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
@@ -74,7 +73,6 @@
         cameraVideo.srcObject = stream;
         await cameraVideo.play();
       } catch (err) {
-        // در صورت عدم دسترسی به دوربین پشت، باز کردن دوربین پیش‌فرض
         try {
           const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
           cameraVideo.srcObject = fallbackStream;
@@ -82,14 +80,11 @@
         } catch (e) {}
       }
 
-      // پخش خودکار ویدیوی کاراکتر (و فعال‌سازی صدا در صورت لمس صفحه)
+      // اطمینان از بی‌صدا بودن کامل ویدیو
+      chromaVideo.muted = true;
       chromaVideo.play().catch(() => {});
-      window.addEventListener('pointerdown', () => {
-        if (chromaVideo.paused) chromaVideo.play();
-        chromaVideo.muted = false;
-      }, { once: true });
 
-      // ۲. راه‌اندازی صحنه سه‌بعدی Three.js
+      // ۲. راه‌اندازی صحنه Three.js
       const renderer = new THREE.WebGLRenderer({
         canvas: canvas,
         alpha: true,
@@ -100,14 +95,15 @@
 
       const scene = new THREE.Scene();
       const camera = new THREE.PerspectiveCamera(
-        60,
+        65,
         window.innerWidth / window.innerHeight,
         0.1,
-        500
+        100
       );
-      camera.position.set(0, 1.6, 0); // ارتفاع استاندارد دید انسان (۱.۶ متر)
+      // تنظیم ارتفاع زاویه دید دوربین در سطح چشم انسان
+      camera.position.set(0, 1.6, 0);
 
-      // ۳. شیدر هوشمند حذف پرده سبز (Chroma Key + Spill Suppression)
+      // ۳. شیدر حذف کروماکی (سبز) با کیفیت بالا
       const videoTexture = new THREE.VideoTexture(chromaVideo);
       videoTexture.minFilter = THREE.LinearFilter;
       videoTexture.magFilter = THREE.LinearFilter;
@@ -119,9 +115,9 @@
         uniforms: {
           uTexture: { value: videoTexture },
           uKeyColor: { value: new THREE.Color(0.05, 0.95, 0.05) },
-          uSimilarity: { value: 0.42 },
-          uSmoothness: { value: 0.12 },
-          uSpill: { value: 0.18 }
+          uSimilarity: { value: 0.40 },
+          uSmoothness: { value: 0.10 },
+          uSpill: { value: 0.15 }
         },
         vertexShader: `
           varying vec2 vUv;
@@ -152,7 +148,6 @@
             float baseMask = chromaDist - uSimilarity;
             float alpha = pow(clamp(baseMask / uSmoothness, 0.0, 1.0), 1.5);
 
-            // حذف بازتاب رنگ سبز از لبه‌های کاراکتر
             float spillVal = pow(clamp(baseMask / uSpill, 0.0, 1.0), 1.5);
             float desat = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
             vec3 cleanColor = mix(vec3(desat), texColor.rgb, spillVal);
@@ -163,220 +158,34 @@
         `
       });
 
-      // ۴. ساخت مدل کاراکتر با ابعاد واقعی (ارتفاع ۲.۸ متر به همراه پرچم)
+      // ۴. تنظیم اندازه واقعی کاراکتر (قد حدود ۱.۸۵ متر، هم‌قد افراد واقعی)
       const characterGroup = new THREE.Group();
-      const charHeight = 2.8;
-      const charAspect = 336 / 592; // نسبت تصویر ویدیو
+      const charHeight = 1.85; // ارتفاع استاندارد یک انسان کامل
+      const charAspect = 336 / 592;
       const charWidth = charHeight * charAspect;
 
       const planeGeo = new THREE.PlaneGeometry(charWidth, charHeight);
-      // انتقال نقطه ثبات (Pivot) به کف پای کاراکتر
-      planeGeo.translate(0, charHeight / 2, 0);
+      planeGeo.translate(0, charHeight / 2, 0); // قرارگیری از کف پا به سمت بالا
       const characterMesh = new THREE.Mesh(planeGeo, chromaKeyMaterial);
       characterGroup.add(characterMesh);
 
-      // ایجاد سایه طبیعی زیر پای کاراکتر روی سطح محیط
-      const shadowCanvas = document.createElement('canvas');
-      shadowCanvas.width = 128;
-      shadowCanvas.height = 128;
-      const sCtx = shadowCanvas.getContext('2d');
-      const grad = sCtx.createRadialGradient(64, 64, 8, 64, 64, 60);
-      grad.addColorStop(0, 'rgba(0, 0, 0, 0.55)');
-      grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
-      sCtx.fillStyle = grad;
-      sCtx.fillRect(0, 0, 128, 128);
-
-      const shadowTex = new THREE.CanvasTexture(shadowCanvas);
-      const shadowGeo = new THREE.PlaneGeometry(charWidth * 0.9, charWidth * 0.5);
-      shadowGeo.rotateX(-Math.PI / 2);
-      const shadowMat = new THREE.MeshBasicMaterial({
-        map: shadowTex,
-        transparent: true,
-        depthWrite: false
-      });
-      const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
-      shadowMesh.position.y = 0.01;
-      characterGroup.add(shadowMesh);
-
-      characterGroup.visible = false;
+      // قرار دادن کاراکتر دقیقاً رو‌به‌روی دید دوربین در فاصله مناسب (مثل یک انسان ایستاده روبه‌رو)
+      // فاصله ۲.۲ متری باعث می‌شود دقیقاً هم‌اندازه مردهای درون واگن مترو یا محیط دیده شود
+      characterGroup.position.set(0, -0.2, -2.2);
       scene.add(characterGroup);
 
-      // ۵. اسکنر هوشمند محیط (تشخیص سطوح صاف، پیاده‌رو، خیابان و لبه پشت‌بام)
-      const scanCanvas = document.createElement('canvas');
-      const scanWidth = 96;
-      const scanHeight = 96;
-      scanCanvas.width = scanWidth;
-      scanCanvas.height = scanHeight;
-      const scanCtx = scanCanvas.getContext('2d', { willReadFrequently: true });
-
-      let devicePitch = 0; // زاویه بالا/پایین گوشی (به رادیان)
-      let deviceRoll = 0;
-      let deviceYaw = 0;
-      let hasSensor = false;
-
-      window.addEventListener('deviceorientation', (e) => {
-        if (e.beta !== null && e.gamma !== null) {
-          hasSensor = true;
-          // تبدیل زاویه گوشی به زاویه دید دوربین
-          const betaRad = THREE.MathUtils.degToRad(e.beta);
-          const gammaRad = THREE.MathUtils.degToRad(e.gamma);
-          const alphaRad = THREE.MathUtils.degToRad(e.alpha || 0);
-
-          devicePitch = betaRad - Math.PI / 2;
-          deviceRoll = gammaRad;
-          deviceYaw = alphaRad;
-        }
-      });
-
-      // تابع اسکن تصویر دوربین برای یافتن بهترین سطح افقی (پیاده‌رو/خیابان یا لبه پشت‌بام)
-      function scanEnvironmentForSurface(preferredNormalizedX = null, preferredNormalizedY = null) {
-        if (cameraVideo.readyState < 2) return null;
-
-        scanCtx.drawImage(cameraVideo, 0, 0, scanWidth, scanHeight);
-        const imgData = scanCtx.getImageData(0, 0, scanWidth, scanHeight).data;
-
-        let bestScore = -1;
-        let bestX = scanWidth / 2;
-        let bestY = Math.floor(scanHeight * 0.72);
-
-        const minY = Math.floor(scanHeight * 0.20);
-        const maxY = Math.floor(scanHeight * 0.88);
-        const minX = Math.floor(scanWidth * 0.20);
-        const maxX = Math.floor(scanWidth * 0.80);
-
-        for (let y = minY; y < maxY; y += 2) {
-          for (let x = minX; x < maxX; x += 2) {
-            const idx = (y * scanWidth + x) * 4;
-            const idxAbove = ((y - 2) * scanWidth + x) * 4;
-            const idxBelow = ((y + 2) * scanWidth + x) * 4;
-            const idxLeft = (y * scanWidth + (x - 2)) * 4;
-            const idxRight = (y * scanWidth + (x + 2)) * 4;
-
-            const lum = 0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2];
-            const lumAbove = 0.299 * imgData[idxAbove] + 0.587 * imgData[idxAbove + 1] + 0.114 * imgData[idxAbove + 2];
-            const lumBelow = 0.299 * imgData[idxBelow] + 0.587 * imgData[idxBelow + 1] + 0.114 * imgData[idxBelow + 2];
-            const lumLeft = 0.299 * imgData[idxLeft] + 0.587 * imgData[idxLeft + 1] + 0.114 * imgData[idxLeft + 2];
-            const lumRight = 0.299 * imgData[idxRight] + 0.587 * imgData[idxRight + 1] + 0.114 * imgData[idxRight + 2];
-
-            // لبه‌های افقی قوی و پیوستگی افقی (مشخصه لبه پشت‌بام، جدول خیابان یا کف پیاده‌رو)
-            const verticalGrad = Math.abs(lumAbove - lumBelow);
-            const horizontalContinuity = 255 - Math.abs(lumLeft - lumRight);
-
-            let score = verticalGrad * 0.6 + horizontalContinuity * 0.4;
-
-            // اولویت به مرکز تصویر یا نقطه لمس شده توسط کاربر
-            const normX = x / scanWidth;
-            const normY = y / scanHeight;
-            if (preferredNormalizedX !== null && preferredNormalizedY !== null) {
-              const distToTap = Math.hypot(normX - preferredNormalizedX, normY - preferredNormalizedY);
-              score *= Math.max(0.1, 1.5 - distToTap * 3.0);
-            } else {
-              const centerBias = 1.0 - Math.abs(normX - 0.5) * 0.8;
-              score *= centerBias;
-            }
-
-            if (score > bestScore) {
-              bestScore = score;
-              bestX = x;
-              bestY = y;
-            }
-          }
-        }
-
-        return {
-          ndcX: (bestX / scanWidth) * 2 - 1,
-          ndcY: -(bestY / scanHeight) * 2 + 1,
-          screenRatioY: bestY / scanHeight
-        };
-      }
-
-      // ۶. محاسبه موقعیت سه‌بعدی و مقیاس واقعی متناسب با فاصله در محیط
-      const targetPosition = new THREE.Vector3(0, 0, -5);
-      let isPlaced = false;
-
-      function placeCharacterSmartly(prefX = null, prefY = null) {
-        const surface = scanEnvironmentForSurface(prefX, prefY);
-        if (!surface) return;
-
-        // تخمین فاصله واقعی (بر حسب متر) بر اساس پرسپکتیو عمودی و زاویه دوربین
-        // نقاط پایین‌تر تصویر نزدیک‌تر (پیاده‌رو: ۳ تا ۶ متر) و نقاط بالاتر دورتر (خیابان یا پشت‌بام: ۱۰ تا ۳۵ متر) هستند
-        const verticalFactor = Math.clamp
-          ? Math.clamp(surface.screenRatioY, 0.15, 0.92)
-          : Math.max(0.15, Math.min(0.92, surface.screenRatioY));
-
-        let estimatedDistance;
-        if (verticalFactor > 0.55) {
-          // ناحیه زمین، پیاده‌رو یا خیابان نزدیک
-          estimatedDistance = 3.2 + (1.0 - verticalFactor) * 14.0;
-        } else {
-          // ناحیه دورتر یا ارتفاع (مانند پشت‌بام ساختمان‌ها)
-          estimatedDistance = 10.0 + (0.55 - verticalFactor) * 45.0;
-        }
-
-        // تبدیل نقطه تشخیص داده شده روی صفحه به مختصات سه‌بعدی جهان واقعی
-        const raycaster = new THREE.Raycaster();
-        raycaster.setFromCamera(new THREE.Vector2(surface.ndcX, surface.ndcY), camera);
-
-        const worldPos = new THREE.Vector3();
-        raycaster.ray.at(estimatedDistance, worldPos);
-
-        targetPosition.copy(worldPos);
-        if (!isPlaced) {
-          characterGroup.position.copy(targetPosition);
-          characterGroup.visible = true;
-          isPlaced = true;
-        }
-      }
-
-      // اسکن اولیه خودکار به محض آماده شدن تصویر دوربین
-      const scanInterval = setInterval(() => {
-        if (!isPlaced && cameraVideo.readyState >= 2) {
-          placeCharacterSmartly();
-        }
-      }, 400);
-
-      // امکان جابجایی هوشمند کاراکتر به هر نقطه دلخواه (مثلاً روی یک پشت‌بام خاص یا پیاده‌رو) با لمس صفحه
-      window.addEventListener('pointerdown', (event) => {
-        const normX = event.clientX / window.innerWidth;
-        const normY = event.clientY / window.innerHeight;
-        placeCharacterSmartly(normX, normY);
-      });
-
-      // ۷. حلقه رندر بلادرنگ و هماهنگی با چرخش گوشی
-      const clock = new THREE.Clock();
-
+      // ۵. ثابت نگه داشتن کاراکتر در زاویه مستقیم رو‌به‌روی دوربین بدون کوچک شدن روی زمین
       function animate() {
         requestAnimationFrame(animate);
 
-        const delta = clock.getDelta();
-
-        // اعمال چرخش ژیروسکوپ به دوربین سه‌بعدی در صورت وجود سنسور
-        if (hasSensor) {
-          camera.rotation.order = 'YXZ';
-          camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, devicePitch, 0.15);
-          camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, -deviceYaw * 0.25, 0.15);
-          camera.rotation.z = THREE.MathUtils.lerp(camera.rotation.z, -deviceRoll * 0.15, 0.15);
-        }
-
-        if (isPlaced) {
-          // حرکت نرم کاراکتر به نقطه اسکن شده
-          characterGroup.position.lerp(targetPosition, Math.min(1, delta * 6));
-
-          // چرخش همیشگی صفحه کاراکتر به سمت دوربین (Billboarding افقی) تا طبیعی دیده شود
-          const lookTarget = new THREE.Vector3(
-            camera.position.x,
-            characterGroup.position.y,
-            camera.position.z
-          );
-          characterGroup.lookAt(lookTarget);
-        }
+        // چرخش کاراکتر دقیقاً به سمت دوربین به صورت فیکس و طبیعی
+        characterGroup.lookAt(camera.position.x, characterGroup.position.y, camera.position.z);
 
         renderer.render(scene, camera);
       }
 
       animate();
 
-      // تطبیق خودکار با تغییر ابعاد صفحه
       window.addEventListener('resize', () => {
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
